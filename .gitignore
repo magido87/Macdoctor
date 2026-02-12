@@ -1,0 +1,17 @@
+# Secrets
+.env
+.env.local
+*.key
+
+# macOS
+.DS_Store
+._*
+
+# Logs
+*.log
+*.cache
+
+# Temp files
+*.tmp
+*.swp
+*~
