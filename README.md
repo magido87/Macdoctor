@@ -4,6 +4,8 @@ A terminal-based diagnostic and maintenance tool for macOS. One script, no depen
 
 ![Shell Script](https://img.shields.io/badge/shell-zsh-blue) ![macOS](https://img.shields.io/badge/macOS-12%2B-brightgreen) ![License](https://img.shields.io/badge/license-MIT-green)
 
+![MacDoctor screenshot](screenshot.png)
+
 ---
 
 ## Install
