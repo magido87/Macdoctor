@@ -14,7 +14,7 @@ zmodload zsh/datetime 2>/dev/null
 
 # =============================================================================
 # MACDOCTOR - MACOS SYSTEM UTILITY
-# Version: 6.0 (Obsidian Edition)
+# Version: 6.0
 # Architecture: Apple Silicon M-series
 # OS Support: macOS Tahoe 26.2+ on Apple Silicon (M1/M2/M3+)
 # =============================================================================
@@ -74,7 +74,7 @@ ICON_FIRE="🔥"
 # State Variables
 MODE="STANDARD" # SAFE, STANDARD, FULL
 SUDO_ACTIVE=0
-AUTO_INSTALL=1            # Silent fallback: auto-install missing deps via brew
+AUTO_INSTALL=0            # Require user consent before installing deps via brew
 USE_EMOJI=0
 SHOW_PREFLIGHT=0
 FIRST_RUN=1
@@ -1017,6 +1017,7 @@ run_wifi_diagnostics() {
     fi
 
     echo ""
+    echo "  ${DIM}(Querying ifconfig.me for public IP...)${RESET}"
     local pub_ip=$(curl -s --max-time 4 https://ifconfig.me 2>/dev/null)
     [[ -n "$pub_ip" ]] && ui_kv "  Public IP" "$pub_ip"
     local dns=$(scutil --dns 2>/dev/null | awk '/nameserver\[0\]/{print $3; exit}')
@@ -1309,6 +1310,8 @@ show_dashboard_minimal() {
 # Dashboard style: Top-like (live-updating, rich)
 show_dashboard_top() {
     local running=1
+    local saved_traps
+    saved_traps=$(trap -p EXIT RETURN INT 2>/dev/null)
     trap 'tput cnorm 2>/dev/null || true; return 0' EXIT RETURN
     trap 'running=0' INT
     tput civis 2>/dev/null || true
@@ -1388,13 +1391,17 @@ show_dashboard_top() {
     done
     
     tput cnorm 2>/dev/null || true
+    # Restore previous traps
     trap - EXIT RETURN INT
+    eval "$saved_traps" 2>/dev/null
     return 0
 }
 
 # Dashboard style: Animated bars — per-process visual CPU bars
 show_dashboard_animated() {
     local running=1
+    local saved_traps
+    saved_traps=$(trap -p EXIT RETURN INT 2>/dev/null)
     trap 'tput cnorm 2>/dev/null || true; return 0' EXIT RETURN
     trap 'running=0' INT
     tput civis 2>/dev/null || true
@@ -1478,7 +1485,9 @@ show_dashboard_animated() {
     done
     
     tput cnorm 2>/dev/null || true
+    # Restore previous traps
     trap - EXIT RETURN INT
+    eval "$saved_traps" 2>/dev/null
     return 0
 }
 
@@ -1975,7 +1984,11 @@ save_settings() {
         return 1
     }
     
-    local tmpfile="$CONFIG_DIR/settings.conf.tmp$$"
+    local tmpfile
+    tmpfile=$(mktemp "$CONFIG_DIR/settings.conf.XXXXXX") || {
+        status_line FAIL "Save Settings" "Could not create temp file"
+        return 1
+    }
     (
         umask 077
         cat > "$tmpfile" <<EOF
@@ -2007,7 +2020,7 @@ EOF
         return 1
     }
     
-    chmod 644 "$SETTINGS_FILE" 2>/dev/null
+    chmod 600 "$SETTINGS_FILE" 2>/dev/null
     export MODE AUTO_INSTALL USE_EMOJI SHOW_PREFLIGHT THEME RESULT_STYLE USER_LEVEL
     export DASHBOARD_STYLE COMPACT_MODE SHOW_TECHNICAL_DETAILS ANALYSIS_DEPTH
     return 0
@@ -2210,14 +2223,20 @@ ensure_brew_dep() {
 
     command -v "$bin" &> /dev/null && return 0
 
-    if [[ ${AUTO_INSTALL:-0} -ne 1 ]]; then
-        return 1
-    fi
     if ! check_brew; then
         return 1
     fi
 
-    out "${YELLOW}Installing missing dependency: ${pkg} (for ${bin})...${RESET}"
+    if [[ ${AUTO_INSTALL:-0} -ne 1 ]]; then
+        echo -n "${YELLOW}Missing dependency: ${pkg} (for ${bin}). Install via Homebrew? [y/N]: ${RESET}"
+        local resp
+        read_user_line resp || resp="n"
+        if [[ ! "$resp" =~ ^[Yy] ]]; then
+            return 1
+        fi
+    fi
+
+    out "${YELLOW}Installing dependency: ${pkg} (for ${bin})...${RESET}"
     if brew install "$pkg" &> /dev/null; then
         return 0
     fi
@@ -2227,17 +2246,12 @@ ensure_brew_dep() {
     return 1
 }
 
-# Confirm a risky/destructive action.
+# Confirm a risky/destructive action (delegates to ui_confirm_risky).
 # Usage: confirm_dangerous "What will happen" "TYPE_THIS_WORD"
 confirm_dangerous() {
     local what="$1"
     local codeword="$2"
-    out "${BG_RED}${BOLD}WARNING${RESET} ${YELLOW}${what}${RESET}"
-    out "   Type ${BOLD}${codeword}${RESET} to confirm, or press Enter to cancel."
-    echo -n "   Confirm: "
-    local resp
-    read_user_line resp || resp=""
-    [[ "$resp" == "$codeword" ]]
+    ui_confirm_risky "$codeword" "$what"
 }
 
 # --- LIGHTWEIGHT CACHE HELPERS (FILE-BASED, TTL) ---
@@ -2300,7 +2314,7 @@ preflight_summary() {
     fi
 
     clear
-    ui_title "🧭 MacDoctor Preflight (short)"
+    ui_title "System Preflight"
     out "🖥️  System: $(sw_vers -productName) $(sw_vers -productVersion) | Arch: $(uname -m)"
     out "🧭 Mode: ${MODE} | 📝 Log: $LOG_FILE"
     out "------------------------------------------------"
@@ -2394,7 +2408,17 @@ ask_sudo() {
                 if sudo -v &> /dev/null; then
                     SUDO_ACTIVE=1
                     if [[ "$MODE" == "FULL" && -z "$SUDO_KEEPALIVE_PID" ]]; then
-                        (while true; do sudo -n true; sleep 60; kill -0 "$$" || exit; done 2>/dev/null) &
+                        # Sudo keepalive with 5-minute timeout for security
+                        local sudo_timeout=300
+                        (
+                            local elapsed=0
+                            while (( elapsed < sudo_timeout )); do
+                                sudo -n true 2>/dev/null || exit
+                                sleep 60
+                                (( elapsed += 60 ))
+                                kill -0 "$$" 2>/dev/null || exit
+                            done
+                        ) &
                         SUDO_KEEPALIVE_PID=$!
                         # Cleanup handled by main EXIT trap (combined save_settings + kill keepalive)
                     fi
@@ -2419,11 +2443,31 @@ ask_sudo() {
 safe_delete() {
     local target="$1"
     local force_sudo="$2" # "sudo" or empty
-    
+
     if [[ ! -e "$target" ]]; then return; fi
-    if [[ "$target" == "/" || "$target" == "$HOME" || -z "$target" ]]; then
-        echo "${RED}Refusing to delete top-level path: $target${RESET}"
-        return
+    if [[ -z "$target" ]]; then
+        echo "${RED}Refusing to delete empty path.${RESET}"
+        return 1
+    fi
+
+    # Resolve symlinks and relative paths to prevent traversal attacks
+    local resolved
+    resolved=$(realpath -- "$target" 2>/dev/null || echo "$target")
+
+    # Block system-critical paths
+    case "$resolved" in
+        /|/System*|/usr*|/bin*|/sbin*|/etc*|/var*|/private*|/Library*)
+            echo "${RED}Refusing to delete system path: $resolved${RESET}"
+            log_action "REJECT: safe_delete blocked system path: $resolved"
+            return 1
+            ;;
+    esac
+
+    # Must be under $HOME
+    if [[ "$resolved" == "$HOME" || "$resolved" != "$HOME/"* ]]; then
+        echo "${RED}Refusing to delete path outside home directory: $resolved${RESET}"
+        log_action "REJECT: safe_delete blocked path outside HOME: $resolved"
+        return 1
     fi
     
     # Create backup dir if not exists
@@ -2778,7 +2822,7 @@ run_security_audit() {
     if [[ -r "$tcc_db" ]]; then
         for svc_pair in "kTCCServiceAccessibility:Accessibility" "kTCCServiceScreenCapture:Screen Recording" "kTCCServiceSystemPolicyAllFiles:Full Disk Access" "kTCCServiceCamera:Camera"; do
             local svc="${svc_pair%%:*}" svc_name="${svc_pair##*:}"
-            local app_count=$(sqlite3 "$tcc_db" "SELECT COUNT(*) FROM access WHERE service='$svc' AND allowed=1;" 2>/dev/null || echo "0")
+            local app_count=$(sqlite3 "$tcc_db" "SELECT COUNT(*) FROM access WHERE service=?1 AND allowed=1;" "$svc" 2>/dev/null || echo "0")
             if [[ $app_count -gt 0 ]]; then
                 echo "   ${DIM}${BULLET}${RESET} ${svc_name}: ${HIGHLIGHT}${app_count}${RESET} ${DIM}apps with access${RESET}"
             else
@@ -2791,7 +2835,7 @@ run_security_audit() {
         if [[ -r "$user_tcc" ]]; then
             for svc_pair in "kTCCServiceAccessibility:Accessibility" "kTCCServiceScreenCapture:Screen Recording" "kTCCServiceCamera:Camera" "kTCCServiceMicrophone:Microphone"; do
                 local svc="${svc_pair%%:*}" svc_name="${svc_pair##*:}"
-                local app_count=$(sqlite3 "$user_tcc" "SELECT COUNT(*) FROM access WHERE service='$svc' AND auth_value=2;" 2>/dev/null || echo "?")
+                local app_count=$(sqlite3 "$user_tcc" "SELECT COUNT(*) FROM access WHERE service=?1 AND auth_value=2;" "$svc" 2>/dev/null || echo "?")
                 echo "   ${DIM}${BULLET}${RESET} ${svc_name}: ${HIGHLIGHT}${app_count}${RESET} ${DIM}apps${RESET}"
             done
         else
@@ -2926,8 +2970,8 @@ run_security_audit() {
 advanced_process_inspector() {
     while true; do
         clear
-        ui_title "${ICON_EYE} ADVANCED PROCESS INSPECTOR"
-        ui_hint "🧭 Top 10 processes by CPU usage. Enter PID to inspect."
+        ui_title "${ICON_EYE} Process Inspector"
+        ui_hint "Top 10 processes by CPU. Enter a PID to inspect."
         echo ""
         echo "   ${BOLD}PID      COMMAND              %CPU   %MEM   THREADS${RESET}"
         echo "   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -2948,7 +2992,7 @@ advanced_process_inspector() {
         
         if [[ "$target_pid" == "0" ]]; then return; fi
         
-        if [[ "$target_pid" =~ ^[0-9]+$ ]]; then
+        if [[ "$target_pid" =~ ^[0-9]+$ ]] && (( target_pid > 0 && target_pid < 100000 )); then
             clear
             echo "${BOLD}${PRIMARY}INSPECTING PID: $target_pid${RESET}"
             local proc_name=$(ps -p $target_pid -o comm= 2>/dev/null)
@@ -2978,8 +3022,8 @@ advanced_process_inspector() {
 
 run_macmon() {
     clear
-    ui_title "${ICON_GPU} MACMON (NO-SUDO APPLE SILICON MONITOR)"
-    ui_hint "⚡ Lightweight SoC monitor. No sudo required."
+    ui_title "${ICON_GPU} Macmon"
+    ui_hint "Apple Silicon SoC monitor. No sudo required."
     
     if command -v macmon &> /dev/null; then
         echo "macmon: Apple Silicon monitoring tool (CPU/GPU/SoC, no sudo)."
@@ -2988,11 +3032,13 @@ run_macmon() {
         fi
     elif check_brew; then
         echo "macmon is not installed. Install via Homebrew? (y/n): "
-        read -r confirm_install
+        local confirm_install
+        read_user_line confirm_install || confirm_install="n"
         if [[ "$confirm_install" =~ ^[Yy]$ ]]; then
             if brew install macmon; then
                 echo -n "Run macmon now? (y/n): "
-                read -r confirm_run
+                local confirm_run
+                read_user_line confirm_run || confirm_run="n"
                 if [[ "$confirm_run" =~ ^[Yy]$ ]]; then
                     echo "macmon: Apple Silicon monitoring tool (CPU/GPU/SoC, no sudo)."
                     if ! macmon; then
@@ -3013,11 +3059,11 @@ run_macmon() {
 external_monitors() {
     while true; do
         clear
-        ui_title "${ICON_GPU} REAL-TIME SOC MONITORS"
-        ui_hint "🎮 Live CPU/GPU/SoC monitoring tools."
+        ui_title "${ICON_GPU} SoC Monitors"
+        ui_hint "Live CPU/GPU/SoC monitoring."
         echo "1. Run mactop (Homebrew, requires Sudo)"
         echo "2. Run asitop (Python/Pip, requires Sudo)"
-        echo "3. Run macmon (No-Sudo Apple Silicon monitor) ${ICON_ROCKET}"
+        echo "3. Run macmon (Apple Silicon SoC monitor)"
         echo "4. Back"
         echo -n "👉 Selection: "
         local mon_choice
@@ -3030,7 +3076,8 @@ external_monitors() {
                     if check_brew; then
                         echo "${YELLOW}mactop not found. Offering installation...${RESET}"
                         echo -n "Install mactop now? (y/n): "
-                        read -r inst_mactop
+                        local inst_mactop
+                        read_user_line inst_mactop || inst_mactop="n"
                         if [[ "$inst_mactop" =~ ^[Yy]$ ]]; then
                             if brew install mactop &> /dev/null; then
                                 if ask_sudo; then
@@ -3091,8 +3138,8 @@ external_monitors() {
 login_items_manager() {
     while true; do
         clear
-        ui_title "${ICON_TOOL} LOGIN ITEMS & LAUNCH AGENTS"
-        ui_hint "🚀 Manage startup items and background agents."
+        ui_title "${ICON_TOOL} Login Items & Launch Agents"
+        ui_hint "Manage startup items and background agents."
         echo "Scanning system (uses sfltool & launchctl)..."
         
         echo ""
@@ -3148,8 +3195,12 @@ login_items_manager() {
                         echo "Tool sfltool unavailable on this system."
                     else
                         echo -n "Enter Exact Label Name: "
-                        read -r label_name
-                        if sudo sfltool remove --label "$label_name" 2>/dev/null; then
+                        local label_name
+                        read_user_line label_name || label_name=""
+                        if [[ ! "$label_name" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+                            echo "${RED}Invalid label format. Use only letters, digits, dots, hyphens, underscores.${RESET}"
+                            log_action "REJECT: Invalid label_name format: $label_name"
+                        elif sudo sfltool remove --label "$label_name" 2>/dev/null; then
                             echo "${GREEN}Attempted removal of $label_name. Check system logs.${RESET}"
                             log_action "LOGIN_ITEMS: Attempted removal of $label_name."
                         else
@@ -3166,15 +3217,22 @@ login_items_manager() {
                         echo "Tool launchctl unavailable on this system."
                     else
                         echo -n "Enter Service Label (e.g. com.google.keystone): "
-                        read -r svc_label
-                        if ! launchctl bootout gui/$(id -u) "$svc_label" 2>/dev/null; then
+                        local svc_label
+                        read_user_line svc_label || svc_label=""
+                        if [[ ! "$svc_label" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+                            echo "${RED}Invalid service label format. Use only letters, digits, dots, hyphens, underscores.${RESET}"
+                            log_action "REJECT: Invalid svc_label format: $svc_label"
+                        else
+                        local gui_domain="gui/$(id -u)"
+                        if ! launchctl bootout "$gui_domain" "$svc_label" 2>/dev/null; then
                             echo "launchctl failed on this macOS version. Skipping."
                         fi
-                        if ! launchctl disable gui/$(id -u)/"$svc_label" 2>/dev/null; then
+                        if ! launchctl disable "$gui_domain/$svc_label" 2>/dev/null; then
                             echo "launchctl failed on this macOS version. Skipping."
                         else
                             echo "Attempted unload/disable. Check system logs for status."
                             log_action "LAUNCH_AGENT: Attempted unload/disable of $svc_label."
+                        fi
                         fi
                     fi
                 fi
@@ -3187,7 +3245,8 @@ login_items_manager() {
                     else
                         echo "${BG_RED}${BOLD}WARNING: This resets all login items, potentially breaking third-party apps.${RESET}"
                         echo -n "Confirm Global Reset (type 'RESET'): "
-                        read -r confirm_reset
+                        local confirm_reset
+                        read_user_line confirm_reset || confirm_reset=""
                         if [[ "$confirm_reset" == "RESET" ]]; then
                             if sudo sfltool resetbtm 2>/dev/null; then
                                 echo "${GREEN}Login Item Database Reset Complete (resetbtm).${RESET}"
@@ -3343,8 +3402,8 @@ software_update_check() {
 io_monitor_menu() {
     while true; do
         clear
-        ui_title "${ICON_DISK} DEEP I/O & DISK MONITOR"
-        ui_hint "📈 Live disk and network activity tools."
+        ui_title "${ICON_DISK} Disk & I/O Monitor"
+        ui_hint "Live disk and network activity."
         echo "1. File System Activity (fs_usage - Warning: High Volume)"
         echo "2. Network Activity Stream (nettop)"
         echo "3. Per-Process I/O (iotop/fs_usage fallback)"
@@ -3389,7 +3448,8 @@ io_monitor_menu() {
                     echo "Tool iotop unavailable on this system."
                     if check_brew; then
                         echo -n "Install iotop via Homebrew now? (y/n): "
-                        read -r inst_iotop
+                        local inst_iotop
+                        read_user_line inst_iotop || inst_iotop="n"
                         if [[ "$inst_iotop" =~ ^[Yy]$ ]]; then
                             if brew install iotop &> /dev/null; then
                                 if ask_sudo; then
@@ -3667,7 +3727,7 @@ run_local_semantic_analysis() {
 }
 
 run_quick_scan() {
-    ui_title "⚡ Quick System Scan"
+    ui_title "${ICON_SEARCH} Quick System Scan"
     ui_hint "Fast snapshot of disk, memory, and top CPU."
     draw_progress_bar 1
     
@@ -3720,7 +3780,7 @@ run_quick_scan() {
 }
 
 run_deep_scan() {
-    ui_title "🧪 Deep Diagnostic Scan"
+    ui_title "${ICON_SEARCH} Deep Diagnostic Scan"
     ui_hint "More detail on caches, logs, and startup items."
     draw_progress_bar 3
     
@@ -3762,8 +3822,8 @@ run_ultra_scan() {
     local report_file="$HOME/Desktop/MacDoctor_Report_$(date +%Y-%m-%d_%H%M%S).txt"
     REPORT_FILE="$report_file"
 
-    ui_title "${ICON_ROCKET} ULTRA SYSTEM SCAN (FULL)"
-    ui_hint "🚀 Covers CPU, GPU, Disk, Network, Security, Daemons, and Risk Analysis."
+    ui_title "${ICON_SEARCH} Full System Scan"
+    ui_hint "Covers CPU, GPU, disk, network, security, daemons, and processes."
     echo "MacDoctor Ultra Scan Report - $(date '+%Y-%m-%d_%H-%M-%S')" > "$report_file"
     echo "================================================================================" >> "$report_file"
     draw_progress_bar 5
@@ -3810,6 +3870,9 @@ run_ultra_scan() {
     echo "--- 6. CLEANUP & RECOMMENDATIONS ---" >> "$report_file"
     echo "Heavy Caches:" >> "$report_file"
     du -sh ~/Library/Caches/* 2>/dev/null | sort -rh | head -n 5 >> "$report_file"
+
+    # Restrict report file permissions (contains sensitive system info)
+    chmod 600 "$report_file" 2>/dev/null
 
     echo ""
     echo "${GREEN}${ICON_OK} Ultra Scan Complete. Report saved to Desktop.${RESET}"
@@ -3864,12 +3927,13 @@ cleanup_deep() {
     # Xcode items
     if [[ -d "$HOME/Library/Developer/Xcode/DerivedData" ]]; then
         echo -n "   Clean Xcode DerivedData? (y/n): "
-        read -r resp
+        local resp
+        read_user_line resp || resp="n"
         if [[ "$resp" =~ ^[Yy]$ ]]; then safe_delete "$HOME/Library/Developer/Xcode/DerivedData"; fi
     fi
     if [[ -d "$HOME/Library/Developer/Xcode/Archives" ]]; then
         echo -n "   Clean Xcode Archives? (y/n): "
-        read -r resp
+        read_user_line resp || resp="n"
         if [[ "$resp" =~ ^[Yy]$ ]]; then safe_delete "$HOME/Library/Developer/Xcode/Archives"; fi
     fi
     
@@ -3889,7 +3953,7 @@ cleanup_deep() {
     # Docker
     if command -v docker &> /dev/null; then
         echo -n "   Prune Docker? (y/n): "
-        read -r resp
+        read_user_line resp || resp="n"
         if [[ "$resp" =~ ^[Yy]$ ]]; then
             if ! docker system prune -f &> /dev/null; then
                 echo "docker failed on this macOS version. Skipping."
@@ -3916,7 +3980,7 @@ cleanup_aggressive() {
     echo "${BOLD}${BG_RED}WARNING: Aggressive Cleanup initiated.${RESET}"
     echo "Includes: Logs, Snapshots, RAM, DNS, Maintenance Scripts."
     echo -n "Confirm (type 'YES'): "
-    read -r resp
+    read_user_line resp || resp=""
     if [[ "$resp" != "YES" ]]; then echo "Aborted."; return; fi
     
     draw_progress_bar 4
@@ -3926,8 +3990,12 @@ cleanup_aggressive() {
     # Periodic Maintenance
     echo "   ${ICON_TOOL} Running Periodic Maintenance..."
     if confirm_dangerous "Run periodic daily/weekly/monthly maintenance (sudo periodic)" "YES"; then
-        sudo periodic daily weekly monthly
-        log_action "Ran sudo periodic maintenance."
+        if sudo periodic daily weekly monthly; then
+            log_action "Ran sudo periodic maintenance."
+        else
+            echo "   ${YELLOW}Warning: periodic maintenance failed.${RESET}"
+            log_action "FAIL: sudo periodic maintenance failed."
+        fi
     else
         status_line INFO "periodic" "Skipped."
     fi
@@ -3947,8 +4015,12 @@ cleanup_aggressive() {
     fi
     
     echo "   ${ICON_NET} Flushing DNS..."
-    sudo dscacheutil -flushcache 2>/dev/null
-    sudo killall -HUP mDNSResponder 2>/dev/null
+    if ! sudo dscacheutil -flushcache 2>/dev/null; then
+        echo "   ${YELLOW}Warning: DNS cache flush failed.${RESET}"
+    fi
+    if ! sudo killall -HUP mDNSResponder 2>/dev/null; then
+        echo "   ${YELLOW}Warning: mDNSResponder restart failed.${RESET}"
+    fi
     log_action "Flushed DNS cache."
     
     echo "   ${ICON_RAM} Purging RAM..."
@@ -3960,7 +4032,8 @@ cleanup_aggressive() {
     fi
     
     echo -n "   Rebuild Spotlight? (y/n): "
-    read -r spot
+    local spot
+    read_user_line spot || spot="n"
     if [[ "$spot" =~ ^[Yy]$ ]]; then
         if ! command -v mdutil &> /dev/null; then
             echo "Tool mdutil unavailable on this system."
@@ -3986,7 +4059,8 @@ run_mac_cleanup_py() {
         echo "mac-cleanup-py is an external, opinionated deep-clean tool."
         echo "It may remove additional caches beyond MacDoctor's own cleanup."
         echo -n "Run mac-cleanup-py now? (y/n): "
-        read -r confirm
+        local confirm
+        read_user_line confirm || confirm="n"
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
             log_action "Running mac-cleanup-py."
             if ! mac-cleanup-py; then
@@ -3995,11 +4069,13 @@ run_mac_cleanup_py() {
         fi
     elif check_brew; then
         echo "mac-cleanup-py is not installed. Install via Homebrew and run it? (y/n): "
-        read -r confirm_install
+        local confirm_install
+        read_user_line confirm_install || confirm_install="n"
         if [[ "$confirm_install" =~ ^[Yy]$ ]]; then
             if brew install mac-cleanup-py; then
                 echo -n "Run mac-cleanup-py now? (y/n): "
-                read -r confirm_run
+                local confirm_run
+                read_user_line confirm_run || confirm_run="n"
                 if [[ "$confirm_run" =~ ^[Yy]$ ]]; then
                     log_action "Running mac-cleanup-py."
                     if ! mac-cleanup-py; then
@@ -4021,9 +4097,10 @@ cleanup_dsstore() {
     echo "It only runs under your Home folder ($HOME)."
     echo "It can reset folder view preferences, but does NOT delete user data."
     echo -n "Proceed with .DS_Store cleanup in your Home folder? (y/n): "
-    read -r confirm
+    local confirm
+    read_user_line confirm || confirm="n"
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        find "$HOME" -name ".DS_Store" -delete 2>/dev/null
+        timeout 60 find "$HOME" -maxdepth 8 -name ".DS_Store" -delete 2>/dev/null
         log_action "Cleaned .DS_Store files in $HOME"
         echo "${GREEN}.DS_Store cleanup complete.${RESET}"
     fi
@@ -4057,8 +4134,8 @@ handle_cleanup() {
 
 run_wizard() {
     clear
-    ui_title "${ICON_WIZARD} SYSTEM OPTIMIZATION WIZARD"
-    ui_hint "🧠 I will suggest a few safe, targeted tweaks. You decide each step."
+    ui_title "${ICON_WIZARD} Optimization Wizard"
+    ui_hint "Suggests a few safe tweaks. You decide each step."
     echo "Scanning system for recommendations... ⏳"
     draw_progress_bar 2
     local rec_count=0
@@ -4068,7 +4145,8 @@ run_wizard() {
     echo "${BOLD}1. 🌐 Network Optimization (DNS)${RESET}"
     echo "   This can fix slow lookups or stale DNS records."
     echo -n "   Apply DNS Flush? (y/n): "
-    read -r r1
+    local r1
+    read_user_line r1 || r1="n"
     if [[ "$r1" =~ ^[Yy]$ ]]; then 
         if ask_sudo; then 
             sudo dscacheutil -flushcache 2>/dev/null; sudo killall -HUP mDNSResponder 2>/dev/null; 
@@ -4082,7 +4160,8 @@ run_wizard() {
     echo "${BOLD}2. 💾 Memory Optimization${RESET}"
     echo "   Frees inactive memory. Safe, but may briefly slow apps."
     echo -n "   Purge RAM? (y/n): "
-    read -r r2
+    local r2
+    read_user_line r2 || r2="n"
     if [[ "$r2" =~ ^[Yy]$ ]]; then 
         if ask_sudo; then 
             sudo purge; 
@@ -4100,7 +4179,8 @@ run_wizard() {
         echo "   ${RED}Gatekeeper is OFF.${RESET}"
         echo "   This helps block unsigned apps."
         echo -n "   Enable Gatekeeper now? (y/n): "
-        read -r r3
+        local r3
+        read_user_line r3 || r3="n"
         if [[ "$r3" =~ ^[Yy]$ ]]; then
              if ask_sudo; then sudo spctl --master-enable 2>/dev/null; ((rec_count++)); log_action "WIZARD: Gatekeeper enabled."; fi
         fi
@@ -4130,7 +4210,8 @@ rebuild_font_caches() {
     echo "Clearing font caches may cause some apps to reload fonts."
     echo "No user documents or data are removed."
     echo -n "Rebuild font caches now? (y/n): "
-    read -r confirm
+    local confirm
+    read_user_line confirm || confirm="n"
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         if ask_sudo; then
             if ! sudo atsutil databases -remove 2>/dev/null; then
@@ -4153,7 +4234,8 @@ network_reset_refresh() {
     echo "This will flush DNS cache and attempt to renew DHCP on active interfaces."
     echo "It will NOT delete Wi-Fi networks or system configs."
     echo -n "Run network reset/refresh now? (y/n): "
-    read -r confirm
+    local confirm
+    read_user_line confirm || confirm="n"
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         if ask_sudo; then
             if ! command -v dscacheutil &> /dev/null; then
@@ -4198,8 +4280,8 @@ network_reset_refresh() {
 system_maintenance_menu() {
     while true; do
         clear
-        ui_title "${ICON_TOOL} SYSTEM MAINTENANCE & UTILITIES"
-        ui_hint "🧼 Small fixes that can help performance or networking."
+        ui_title "${ICON_TOOL} Maintenance & Utilities"
+        ui_hint "Small fixes for performance and networking."
         echo "1. Clean .DS_Store files in Home directory"
         echo "2. Rebuild Font Caches (atsutil)"
         echo "3. Network Reset / Refresh (DNS + DHCP Renew)"
@@ -4220,8 +4302,8 @@ system_maintenance_menu() {
 
 run_super_update() {
     clear
-    ui_title "${ICON_UPD} SUPER ADVANCED MACOS UPDATE REPORT"
-    ui_hint "🧩 External utility detected. Launch manually for full control."
+    ui_title "${ICON_UPD} macOS Update Report"
+    ui_hint "External utility detected. Launch manually for full control."
     
     if ! command -v super &> /dev/null; then
         echo "super is not installed on this system."
@@ -5038,6 +5120,7 @@ run_network_test() {
     echo ""
 
     # Download speed (small file)
+    echo "  ${DIM}(Connecting to external servers: Apple CDN, Cloudflare)${RESET}"
     echo "  ${BOLD}${PRIMARY}${BULLET} Download Speed (approx.)${RESET}"
     local dl_start=$EPOCHREALTIME
     curl -s -o /dev/null -w "%{size_download}" "https://cdn.apple.com/content/downloads/13/62/002-57047-A_27LOQHKVUT/dntx7do0xkh19aygm2rpyh6n4s2w3z6ald/InstallAssistant.pkg" --max-time 5 --range 0-1048575 2>/dev/null
@@ -5065,7 +5148,12 @@ run_disk_benchmark() {
     ui_box_bottom
     echo ""
 
-    local test_file="/tmp/.macdoctor_diskbench_$$"
+    local test_file
+    test_file=$(mktemp /tmp/.macdoctor_diskbench_XXXXXX) || {
+        echo "${RED}Could not create temp file for benchmark.${RESET}"
+        pause_continue
+        return 1
+    }
     local bs="1m"
     local count=256  # 256 MB
 
@@ -5181,7 +5269,7 @@ basic_semantic_analysis() {
     if command -v timeout &>/dev/null; then
         small_files=$(timeout 3 find "$HOME" -maxdepth 3 -type f -size -1k 2>/dev/null | wc -l || echo "0")
     else
-        small_files=$(find "$HOME" -maxdepth 2 -type f -size -1k 2>/dev/null | wc -l || echo "0")
+        small_files=$(timeout 5 find "$HOME" -maxdepth 2 -type f -size -1k 2>/dev/null | wc -l || echo "0")
     fi
     
     
@@ -5368,7 +5456,7 @@ collect_disk_metrics() {
     if command -v timeout &>/dev/null; then
         small_files=$(timeout 2 find "$HOME" -maxdepth 2 -type f -size -1k 2>/dev/null | wc -l)
     else
-        small_files=$(find "$HOME" -maxdepth 1 -type f -size -1k 2>/dev/null | wc -l)
+        small_files=$(timeout 5 find "$HOME" -maxdepth 1 -type f -size -1k 2>/dev/null | wc -l)
     fi
     
     printf '{"cache_size_gb":"%.1f","small_files":%d}' "$cache_size" "$small_files"

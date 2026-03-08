@@ -11,7 +11,7 @@ A terminal-based diagnostic and maintenance tool for macOS. One script, no depen
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/macdoctor.git
+git clone https://github.com/magido87/Macdoctor.git
 cd macdoctor
 chmod +x macdoctor.sh
 ./macdoctor.sh
