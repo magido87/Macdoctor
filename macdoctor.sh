@@ -24,6 +24,7 @@ VERSION="6.0.0"
 LOG_FILE="$HOME/.macdoctor.log"
 REPORT_FILE="$HOME/Desktop/MacDoctor_Report_$(date +%Y-%m-%d_%H%M).txt"
 BACKUP_DIR_BASE="$HOME/MacDoctorBackup"
+DISABLE_BACKUPS="${MACDOCTOR_DISABLE_BACKUPS:-1}"
 BIN_DIR="$HOME/bin"
 SELF_NAME="macdoctor"
 DATE_STR=$(date "+%Y-%m-%d_%H-%M-%S")
@@ -732,6 +733,37 @@ get_level_description() {
 get_top_processes() {
     local count="${1:-10}"
     ps -A -o pid,ucomm,pcpu,pmem -r 2>/dev/null | head -n $((count + 1)) | tail -n $count
+}
+
+get_zombie_count() {
+    ps aux 2>/dev/null | awk 'index($0," <defunct>"){count++} END{print count+0}'
+}
+
+count_user_launch_agents() {
+    local count=0
+    [[ -d "$HOME/Library/LaunchAgents" ]] && count=$(ls -1 "$HOME/Library/LaunchAgents" 2>/dev/null | wc -l | tr -d ' ')
+    [[ -z "$count" ]] && count=0
+    echo "$count"
+}
+
+count_nonapple_launch_services() {
+    launchctl list 2>/dev/null | awk 'NR>1 && $3 !~ /^com\.apple/ {count++} END{print count+0}'
+}
+
+count_small_files_limited() {
+    local depth="${1:-2}"
+    local timeout_secs="${2:-0}"
+    local count=""
+
+    if [[ "$timeout_secs" -gt 0 ]] 2>/dev/null && command -v timeout &>/dev/null; then
+        count=$(timeout "$timeout_secs" find "$HOME" -maxdepth "$depth" -type f -size -1k 2>/dev/null | wc -l)
+    else
+        count=$(find "$HOME" -maxdepth "$depth" -type f -size -1k 2>/dev/null | wc -l)
+    fi
+
+    count=$(echo "$count" | tr -d ' ')
+    [[ -z "$count" ]] && count=0
+    echo "$count"
 }
 
 # ============================================================================
@@ -2054,7 +2086,7 @@ first_run_setup() {
     # Step 1: Choose Theme
     echo "${BOLD}${PRIMARY}Step 1/5: Choose Your Theme${RESET}"
     echo ""
-    echo "  ${DIM}Pick a visual style that matches your vibe:${RESET}"
+    echo "  ${DIM}Pick the visual style you prefer:${RESET}"
     echo ""
     echo "  1) ${BOLD}Bronze${RESET} - Warm orange/gold tones"
     echo "  2) ${BOLD}Terminal${RESET} - Classic green-on-dark"
@@ -2469,6 +2501,28 @@ safe_delete() {
         log_action "REJECT: safe_delete blocked path outside HOME: $resolved"
         return 1
     fi
+
+    if [[ "$DISABLE_BACKUPS" == "1" ]]; then
+        echo -n "   ${ICON_TRASH} Deleting $(basename "$target")... "
+        if [[ -n "$force_sudo" ]]; then
+            if sudo rm -rf "$target" 2>/dev/null; then
+                echo "${GREEN}Done${RESET}"
+                log_action "Deleted (Sudo, no backup): $target"
+            else
+                echo "${RED}Failed${RESET}"
+                log_action "FAIL: Delete (Sudo, no backup) failed for $target"
+            fi
+        else
+            if rm -rf "$target" 2>/dev/null; then
+                echo "${GREEN}Done${RESET}"
+                log_action "Deleted (no backup): $target"
+            else
+                echo "${RED}Failed (Permission?)${RESET}"
+                log_action "FAIL: Delete (no backup) failed for $target"
+            fi
+        fi
+        return
+    fi
     
     # Create backup dir if not exists
     mkdir -p "$CURRENT_BACKUP_DIR"
@@ -2499,7 +2553,10 @@ safe_delete() {
 
 get_cpu_load() {
     # Force C locale so decimals use '.' (not ',') and math works reliably.
-    LC_ALL=C top -l 1 2>/dev/null | awk -F'[:,%]+' '/CPU usage/ {printf("%.1f", $2 + $4); exit}' | tr ',' '.'
+    local cpu
+    cpu=$(LC_ALL=C top -l 1 2>/dev/null | awk -F'[:,%]+' '/CPU usage/ {printf("%.1f", $2 + $4); exit}' | tr ',' '.')
+    [[ "$cpu" =~ ^[0-9]+([.][0-9]+)?$ ]] || cpu="0.0"
+    echo "$cpu"
 }
 
 get_memory_usage() {
@@ -2507,10 +2564,11 @@ get_memory_usage() {
     vm_out=$(LC_ALL=C vm_stat 2>/dev/null) || { echo "0"; return; }
 
     local page_size
-    page_size=$(echo "$vm_out" | awk 'match($0,/page size of ([0-9]+)/,a){print a[1]; exit}' 2>/dev/null)
-    [[ -z "$page_size" ]] && page_size=4096
+    page_size=$(sysctl -n hw.pagesize 2>/dev/null)
+    [[ -z "$page_size" ]] && page_size=$(echo "$vm_out" | sed -nE 's/.*page size of ([0-9]+) bytes.*/\1/p' | head -1)
+    [[ -z "$page_size" ]] && page_size=16384
     page_size=${page_size//[^0-9]/}
-    [[ -z "$page_size" ]] && page_size=4096
+    [[ -z "$page_size" ]] && page_size=16384
 
     local pages_active pages_spec pages_wired
     pages_active=$(echo "$vm_out" | awk '/Pages active/{gsub(/\./,""); print $3; exit}' 2>/dev/null)
@@ -3572,7 +3630,7 @@ prompt_semantic_analysis() {
     local resp
 
     echo ""
-    echo -n "  Show semantic AI analysis for ${context_label}? (y/n): "
+    echo -n "  Show local analysis summary for ${context_label}? (y/n): "
     read_user_line resp || resp=""
     [[ "$resp" =~ ^[Yy]$ ]] || return 0
 
@@ -3580,10 +3638,10 @@ prompt_semantic_analysis() {
 }
 
 # ============================================================================
-# LOCAL SEMANTIC ANALYSIS
+# LOCAL ANALYSIS SUMMARY
 # ============================================================================
 
-# Produce human-readable semantic insights from system data.
+# Build a short text summary from collected system data.
 # Called automatically after every scan — no user prompt needed.
 run_local_semantic_analysis() {
     local context="${1:-scan}"
@@ -3606,8 +3664,7 @@ run_local_semantic_analysis() {
     local swap_used_raw=$(sysctl -n vm.swapusage 2>/dev/null | awk '{print $7}')
     [[ -z "$swap_used_raw" ]] && swap_used_raw="0M"
 
-    local zombies=$(ps aux 2>/dev/null | grep -c " <defunct>" || echo "0")
-    [[ "$zombies" -gt 0 ]] && zombies=$((zombies - 1))
+    local zombies=$(get_zombie_count)
 
     # Top process
     local top_line=$(ps aux 2>/dev/null | awk 'NR>1 {gsub(/,/,".",$3); printf "%s %s\n",$3,$11}' | sort -rn | head -1)
@@ -3618,8 +3675,7 @@ run_local_semantic_analysis() {
     local top_cpu_int="${top_cpu%.*}"
 
     # Startup items count
-    local startup_count=0
-    startup_count=$(( $(ls -1 ~/Library/LaunchAgents 2>/dev/null | wc -l) + $(ls -1 ~/Library/LaunchDaemons 2>/dev/null | wc -l) ))
+    local startup_count=$(count_user_launch_agents)
 
     # Cache size
     local cache_raw=$(du -sh ~/Library/Caches 2>/dev/null | awk '{print $1}')
@@ -3729,6 +3785,7 @@ run_local_semantic_analysis() {
 run_quick_scan() {
     ui_title "${ICON_SEARCH} Quick System Scan"
     ui_hint "Fast snapshot of disk, memory, and top CPU."
+    explain "Read-only check. It looks at live system health and does not delete or change anything."
     draw_progress_bar 1
     
     # Collect scan data
@@ -3782,6 +3839,7 @@ run_quick_scan() {
 run_deep_scan() {
     ui_title "${ICON_SEARCH} Deep Diagnostic Scan"
     ui_hint "More detail on caches, logs, and startup items."
+    explain "Read-only check. It lists large caches, logs and startup items so you can decide what to clean later."
     draw_progress_bar 3
     
     # Collect scan data
@@ -3824,6 +3882,7 @@ run_ultra_scan() {
 
     ui_title "${ICON_SEARCH} Full System Scan"
     ui_hint "Covers CPU, GPU, disk, network, security, daemons, and processes."
+    explain "Read-only audit. It saves a detailed report file to Desktop but does not clean files by itself."
     echo "MacDoctor Ultra Scan Report - $(date '+%Y-%m-%d_%H-%M-%S')" > "$report_file"
     echo "================================================================================" >> "$report_file"
     draw_progress_bar 5
@@ -4752,19 +4811,19 @@ show_scan_menu() {
             case $item in
                 1)
                     ui_list_item 1 "⚡ Quick Scan" "Fast | CPU, memory, disk"
-                    ui_explain "    Daily check-ins"
+                    ui_explain "    Reads CPU, RAM, disk and busy apps. Changes nothing."
                     echo ""
                     max_choice=1
                     ;;
                 2)
                     ui_list_item 2 "🔬 Deep Scan" "Moderate | Caches, logs, startup"
-                    ui_explain "    Troubleshooting slowdowns"
+                    ui_explain "    Read-only check of caches, logs and startup items. Deletes nothing."
                     echo ""
                     max_choice=2
                     ;;
                 3)
                     ui_list_item 3 "🧪 Ultra Scan" "Thorough | Full report saved to file"
-                    ui_explain "    Complete health report"
+                    ui_explain "    Deep read-only audit. Saves a report to Desktop but does not clean files."
                     echo ""
                     max_choice=3
                     ;;
@@ -4810,31 +4869,39 @@ show_fix_menu() {
         echo ""
         
         echo "  ${SUCCESS}1${RESET}${DIM})${RESET} ${BOLD}🟢 Safe Cleanup${RESET}"
-        echo "     ${DIM}Browser cache, old logs, temp files${RESET}"
+        echo "     ${DIM}Deletes rebuildable cache, temp files and old user logs${RESET}"
+        echo "     ${DIM}Does not touch documents, photos, downloads or app settings${RESET}"
         printf "     ${DIM}Risk: ${SUCCESS}Very Low${RESET} ${DIM}${BULLET} Quick${RESET}\n"
         echo ""
         echo "  ${WARNING}2${RESET}${DIM})${RESET} ${BOLD}🟡 Deeper Cleanup${RESET}"
-        echo "     ${DIM}+ Xcode cache, Docker, old backups${RESET}"
+        echo "     ${DIM}+ Developer caches like Xcode plus optional Docker/Homebrew cleanup${RESET}"
+        echo "     ${DIM}Can remove rebuildable app data, so the next start may be slower${RESET}"
         printf "     ${DIM}Risk: ${WARNING}Low${RESET} ${DIM}${BULLET} Moderate${RESET}\n"
         echo ""
         echo "  ${ERROR}3${RESET}${DIM})${RESET} ${BOLD}🔴 Aggressive Cleanup${RESET}"
-        echo "     ${DIM}+ APFS snapshots, RAM purge, system logs${RESET}"
+        echo "     ${DIM}+ System maintenance, APFS snapshots, RAM purge and optional Spotlight rebuild${RESET}"
+        echo "     ${DIM}Best for stubborn problems, not regular day-to-day cleaning${RESET}"
         printf "     ${DIM}Risk: ${ERROR}Medium${RESET} ${DIM}${BULLET} Takes longer ${BULLET} ${ERROR}Requires password${RESET}\n"
         echo ""
         echo "  ${HIGHLIGHT}4${RESET}${DIM})${RESET} ${BOLD}🧙 Optimization Wizard${RESET}"
-        echo "     ${DIM}Let MacDoctor suggest safe tweaks${RESET}"
+        echo "     ${DIM}Explains one suggested fix at a time and asks before each change${RESET}"
+        echo ""
+        echo "  ${INFO}5${RESET}${DIM})${RESET} ${BOLD}🧹 Optimera (Process Cleanup)${RESET}"
+        echo "     ${DIM}Looks for leftover Node/Python/dev server processes and offers to stop them${RESET}"
+        echo "     ${DIM}It does not delete files. It only stops selected background processes${RESET}"
         echo ""
         ui_list_item 0 "Back" "Return to main menu"
         echo ""
-        
+
         local choice
-        choice=$(ui_choose "Choose cleanup depth" 4)
-        
+        choice=$(ui_choose "Choose cleanup depth" 5)
+
         case $choice in
             1) show_cleanup_preview "SAFE" ;;
             2) show_cleanup_preview "DEEP" ;;
             3) show_cleanup_preview "AGGRESSIVE" ;;
             4) run_wizard ;;
+            5) run_optimize_memory ;;
             0) break ;;
         esac
     done
@@ -4863,44 +4930,49 @@ show_cleanup_preview() {
     
     case "$depth" in
         SAFE)
+            echo "  ${DIM}What this means:${RESET} remove temporary files that apps can recreate later."
             [[ -n "$sz_safari" ]]  && echo "  📁 Safari cache — ${sz_safari}"
             [[ -n "$sz_firefox" ]] && echo "  📁 Firefox cache — ${sz_firefox}"
             [[ -n "$sz_chrome" ]]  && echo "  📁 Chrome cache — ${sz_chrome}"
             [[ -n "$sz_logs" ]]    && echo "  📁 User logs — ${sz_logs}"
             echo "  📁 Other app caches (Spotify, Teams, Slack, Discord)"
             echo ""
-            echo "  ${DIM}All items are backed up before removal.${RESET}"
+            echo "  ${DIM}Your personal files are not included here.${RESET}"
+            echo "  ${DIM}Items are deleted permanently (backup disabled).${RESET}"
             echo ""
             ;;
         DEEP)
+            echo "  ${DIM}What this means:${RESET} Safe cleanup plus larger developer/app rebuild data."
             echo "  📁 All from Safe cleanup (browser caches, logs)"
             [[ -n "$sz_xcode" ]]      && echo "  📁 Xcode DerivedData — ${sz_xcode}"
             [[ -n "$sz_brew_cache" ]]  && echo "  📦 Homebrew cache — ${sz_brew_cache}"
             command -v docker &>/dev/null && echo "  🐳 Docker unused images"
             echo ""
-            echo "  ${DIM}All items are backed up before removal.${RESET}"
+            echo "  ${DIM}Apps may need to rebuild some data the next time you open them.${RESET}"
+            echo "  ${DIM}Items are deleted permanently (backup disabled).${RESET}"
             echo ""
             ;;
         AGGRESSIVE)
+            echo "  ${DIM}What this means:${RESET} system-level maintenance for stubborn space or performance issues."
             echo "  📁 All from Safe + Deep cleanup"
             echo "  📸 APFS snapshots (Time Machine local)"
             echo "  🧠 RAM purge (inactive memory)"
             echo "  📋 System logs (requires password)"
             echo "  🔎 Spotlight re-index (optional)"
             echo ""
-            echo "  ${RED}Requires password. Uses sudo.${RESET}"
+            echo "  ${RED}Requires password. Uses sudo and affects system services.${RESET}"
             echo ""
             ;;
     esac
     
     # Backup location
-    local backup_dir="$HOME/MacDoctorBackup-$(date +%Y-%m-%d_%H%M)"
+    local backup_dir="Disabled (no backup)"
     echo "  ${CYAN}Safety Information:${RESET}"
     echo ""
     ui_badge INFO "Backup" "${backup_dir}"
-    ui_explain "All deleted files saved here for 30 days"
+    ui_explain "Deleted files are not archived, so there is no built-in undo for this cleanup."
     echo ""
-    ui_badge OK "Restore" "Settings > Backups > Restore"
+    ui_badge INFO "Restore" "Not available while backups are disabled"
     echo ""
     
     # Current disk
@@ -4911,7 +4983,7 @@ show_cleanup_preview() {
     
     # Confirm
     echo "  ${CYAN}Ready to proceed?${RESET}"
-    echo "  ${DIM}This is safe — everything is backed up.${RESET}"
+    echo "  ${DIM}This deletes files permanently (no backup).${RESET}"
     echo ""
     
     local confirmed=1
@@ -4940,6 +5012,16 @@ show_cleanup_running() {
     
     # Measure disk before
     local disk_before=$(df -k / 2>/dev/null | tail -1 | awk '{print $3}')
+    local disk_pct_before=$(df -h / 2>/dev/null | tail -1 | awk '{print $5}' | tr -d '%')
+    local cpu_before=$(get_cpu_load 2>/dev/null || echo "0")
+    cpu_before="${cpu_before/,/.}"
+    local cpu_before_int="${cpu_before%.*}"
+    [[ -z "$cpu_before_int" ]] && cpu_before_int=0
+    local ram_before=$(get_memory_usage 2>/dev/null || echo "0")
+    local mem_bytes=$(sysctl -n hw.memsize 2>/dev/null)
+    local total_mem=$(( ${mem_bytes:-0} / 1024 / 1024 ))
+    [[ "$total_mem" -le 0 ]] 2>/dev/null && total_mem=16384
+    local ram_pct_before=$(LC_ALL=C awk -v u="$ram_before" -v t="$total_mem" 'BEGIN{if(t>0){printf "%.0f",(u/t)*100} else {print "0"}}')
     
     clear
     echo ""
@@ -4974,9 +5056,12 @@ show_cleanup_running() {
     
     local disk_pct_now=$(df -h / 2>/dev/null | tail -1 | awk '{print $5}')
     local disk_free_now=$(df -h / 2>/dev/null | tail -1 | awk '{print $4}')
-    
-    local disk_pct_before=$(LC_ALL=C awk -v b="$disk_before" -v a="$disk_after" -v t="$disk_before" 'BEGIN{if(t>0){printf "%.0f", (b/(b+(a-b+t-b)))*100} else {print "?"}}' 2>/dev/null)
-    disk_pct_before=$(df -h / 2>/dev/null | tail -1 | awk '{print $5}' | tr -d '%')
+    local cpu_after=$(get_cpu_load 2>/dev/null || echo "0")
+    cpu_after="${cpu_after/,/.}"
+    local cpu_after_int="${cpu_after%.*}"
+    [[ -z "$cpu_after_int" ]] && cpu_after_int=0
+    local ram_after=$(get_memory_usage 2>/dev/null || echo "0")
+    local ram_pct_after=$(LC_ALL=C awk -v u="$ram_after" -v t="$total_mem" 'BEGIN{if(t>0){printf "%.0f",(u/t)*100} else {print "0"}}')
 
     echo ""
     ui_box_top "Cleanup Complete"
@@ -4988,17 +5073,246 @@ show_cleanup_running() {
     echo "  ${DIM}Free Space  ${RESET}                ${SUCCESS}${disk_free_now}${RESET}"
     echo "  ${DIM}Freed       ${RESET}${BOLD}${SUCCESS}${freed_display}${RESET}"
     echo ""
-    local h_before=$(compute_health_score "$cpu_int" "$ram_pct" "${disk_pct_before:-0}")
+    local h_before=$(compute_health_score "$cpu_before_int" "$ram_pct_before" "${disk_pct_before:-0}")
     local disk_pct_now_num=$(echo "$disk_pct_now" | tr -d '%')
-    local h_after=$(compute_health_score 0 0 "${disk_pct_now_num:-0}")
+    local h_after=$(compute_health_score "$cpu_after_int" "$ram_pct_after" "${disk_pct_now_num:-0}")
     if [[ $h_after -gt $h_before ]]; then
         echo "  ${DIM}Health Score ${RESET}${YELLOW}${h_before}${RESET}  →  ${SUCCESS}${BOLD}${h_after}${RESET}  ${SUCCESS}▲${RESET}"
     else
         echo "  ${DIM}Health Score ${RESET}${h_before}  →  ${h_after}"
     fi
     echo ""
-    ui_explain "Backup saved to: ${CURRENT_BACKUP_DIR}"
+    ui_explain "Backups disabled: no archive was created."
     echo ""
+
+    pause_continue
+}
+
+# --- OPTIMIZE MEMORY (Process Cleanup) ---
+
+run_optimize_memory() {
+    clear
+    echo ""
+    ui_box_top "Optimera — Process Cleanup"
+    ui_box_row "${DIM}Find leftover dev processes eating RAM${RESET}"
+    ui_box_bottom
+    echo ""
+    ui_explain "This only targets common developer/background processes like Node, Python servers, Docker helpers and build tools."
+    ui_explain "It does not delete files. You review the list before anything is stopped."
+    echo ""
+
+    # Patterns: process name regex -> human-readable label
+    # Excludes: GUI apps (Cursor, Code, Claude, ChatGPT) main processes
+    local -a patterns labels
+    patterns=(
+        "node(?!.*(/Cursor|/Code |/Claude|/Electron))"
+        "python[0-9.]*"
+        "uvicorn"
+        "streamlit"
+        "vite"
+        "next-server"
+        "webpack"
+        "esbuild"
+        "npm (?:run|exec|start)"
+        "localhost"
+        "flask"
+        "gunicorn"
+        "celery"
+        "redis-server"
+        "mongod"
+        "postgres(?!.*com\\.apple)"
+        "mysqld"
+        "docker(?!.*Docker\\.app)"
+        "com\\.docker\\.backend"
+    )
+    labels=(
+        "Node.js"
+        "Python"
+        "Uvicorn"
+        "Streamlit"
+        "Vite"
+        "Next.js"
+        "Webpack"
+        "esbuild"
+        "npm"
+        "localhost"
+        "Flask"
+        "Gunicorn"
+        "Celery"
+        "Redis"
+        "MongoDB"
+        "PostgreSQL"
+        "MySQL"
+        "Docker"
+        "Docker backend"
+    )
+
+    echo "  ${BOLD}${PRIMARY}Scanning for leftover dev processes...${RESET}"
+    echo ""
+
+    # Collect matching processes: pid, rss (KB), command
+    local -a found_pids found_labels found_rss found_cmds
+    local total_rss=0
+    local my_pid=$$
+
+    for i in "${!patterns[@]}"; do
+        local pat="${patterns[$i]}"
+        local lbl="${labels[$i]}"
+
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local pid=$(echo "$line" | awk '{print $1}')
+            local rss=$(echo "$line" | awk '{print $2}')
+            local cmd=$(echo "$line" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
+
+            # Skip our own process tree
+            [[ "$pid" == "$my_pid" ]] && continue
+
+            # Skip if already collected
+            local dup=0
+            for ep in "${found_pids[@]}"; do
+                [[ "$ep" == "$pid" ]] && { dup=1; break; }
+            done
+            [[ $dup -eq 1 ]] && continue
+
+            found_pids+=("$pid")
+            found_labels+=("$lbl")
+            found_rss+=("$rss")
+            found_cmds+=("$cmd")
+            total_rss=$((total_rss + rss))
+        done < <(PATTERN="$pat" SELF_PID="$my_pid" ps -eo pid,rss,command 2>/dev/null | perl -ne '
+            BEGIN {
+                $re = qr/$ENV{PATTERN}/i;
+                $self = $ENV{SELF_PID};
+            }
+            next if $. == 1;
+            if (/^\s*(\d+)\s+(\d+)\s+(.*)$/) {
+                next if $1 == $self;
+                print "$1 $2 $3\n" if $3 =~ $re;
+            }
+        ')
+    done
+
+    local count=${#found_pids[@]}
+
+    if [[ $count -eq 0 ]]; then
+        ui_toast "No leftover dev processes found. Your system is clean!" "OK"
+        pause_continue
+        return
+    fi
+
+    # Display found processes
+    local total_mb=$(awk "BEGIN{printf \"%.0f\", $total_rss / 1024}")
+    echo "  ${WARNING}Found ${count} process(es) using ~${total_mb} MB RAM:${RESET}"
+    echo ""
+
+    printf "  ${DIM}%-4s %-7s %-8s %-14s %s${RESET}\n" "#" "PID" "RAM" "Type" "Command"
+    echo "  ${DIM}$(printf '%.0s─' {1..65})${RESET}"
+
+    for i in "${!found_pids[@]}"; do
+        local mb=$(awk "BEGIN{printf \"%.1f\", ${found_rss[$i]} / 1024}")
+        local short_cmd="${found_cmds[$i]}"
+        # Truncate long commands
+        [[ ${#short_cmd} -gt 35 ]] && short_cmd="${short_cmd:0:32}..."
+        printf "  ${HIGHLIGHT}%-4s${RESET} %-7s ${WARNING}%6s MB${RESET}  %-14s ${DIM}%s${RESET}\n" \
+            "$((i+1))" "${found_pids[$i]}" "$mb" "${found_labels[$i]}" "$short_cmd"
+    done
+    echo ""
+
+    # Ask user what to do
+    echo "  ${CYAN}Options:${RESET}"
+    echo "  ${HIGHLIGHT} a ${RESET} Kill all listed processes"
+    echo "  ${HIGHLIGHT}1-${count}${RESET} Kill specific process by number"
+    echo "  ${HIGHLIGHT} 0 ${RESET} Cancel — go back"
+    echo ""
+    echo -n "  👉 Choose [0/a/1-${count}]: " >&2
+    local user_choice
+    read_user_line user_choice || { return; }
+
+    [[ "$user_choice" == "0" || -z "$user_choice" ]] && return
+
+    local -a kill_indices
+    if [[ "$user_choice" == "a" || "$user_choice" == "A" ]]; then
+        for i in "${!found_pids[@]}"; do kill_indices+=("$i"); done
+    elif [[ "$user_choice" =~ ^[0-9]+$ ]] && (( user_choice >= 1 && user_choice <= count )); then
+        kill_indices+=("$((user_choice - 1))")
+    else
+        echo "  ${ERROR}Invalid choice.${RESET}"
+        pause_continue
+        return
+    fi
+
+    # Confirm before killing
+    local target_count=${#kill_indices[@]}
+    echo ""
+    echo "  ${WARNING}About to terminate ${target_count} process(es). Try graceful (SIGTERM) first.${RESET}"
+    echo -n "  ${CYAN}Proceed? [y/N]: ${RESET}" >&2
+    local confirm
+    read_user_line confirm || { return; }
+    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { echo "  ${DIM}Cancelled.${RESET}"; pause_continue; return; }
+
+    echo ""
+    local killed=0
+    local freed_rss=0
+
+    for idx in "${kill_indices[@]}"; do
+        local pid="${found_pids[$idx]}"
+        local lbl="${found_labels[$idx]}"
+        local rss="${found_rss[$idx]}"
+        local mb=$(awk "BEGIN{printf \"%.1f\", $rss / 1024}")
+
+        echo -n "  ${ICON_TRASH} ${lbl} (PID ${pid}, ${mb} MB)... "
+
+        # Try SIGTERM first
+        if kill -TERM "$pid" 2>/dev/null; then
+            # Wait up to 3 seconds for graceful exit
+            local waited=0
+            while kill -0 "$pid" 2>/dev/null && (( waited < 6 )); do
+                sleep 0.5
+                waited=$((waited + 1))
+            done
+
+            if kill -0 "$pid" 2>/dev/null; then
+                # Still alive — ask before SIGKILL
+                echo "${WARNING}still running${RESET}"
+                echo -n "    ${DIM}Force kill (SIGKILL)? [y/N]: ${RESET}" >&2
+                local force
+                read_user_line force || force="n"
+                if [[ "$force" == "y" || "$force" == "Y" ]]; then
+                    kill -9 "$pid" 2>/dev/null
+                    sleep 0.3
+                    if ! kill -0 "$pid" 2>/dev/null; then
+                        echo "    ${SUCCESS}Force killed.${RESET}"
+                        killed=$((killed + 1))
+                        freed_rss=$((freed_rss + rss))
+                        log_action "Force killed $lbl (PID $pid, ${mb} MB)"
+                    else
+                        echo "    ${ERROR}Failed to kill.${RESET}"
+                        log_action "FAIL: Could not kill $lbl (PID $pid)"
+                    fi
+                else
+                    echo "    ${DIM}Skipped.${RESET}"
+                fi
+            else
+                echo "${SUCCESS}Done${RESET}"
+                killed=$((killed + 1))
+                freed_rss=$((freed_rss + rss))
+                log_action "Terminated $lbl (PID $pid, ${mb} MB)"
+            fi
+        else
+            echo "${ERROR}Failed (permission?)${RESET}"
+            log_action "FAIL: No permission to kill $lbl (PID $pid)"
+        fi
+    done
+
+    # Summary
+    echo ""
+    local freed_mb=$(awk "BEGIN{printf \"%.0f\", $freed_rss / 1024}")
+    echo "  ${DIM}────────────────────────────────${RESET}"
+    echo "  ${BOLD}${SUCCESS}Terminated ${killed}/${target_count} process(es)${RESET}"
+    [[ $freed_rss -gt 0 ]] && echo "  ${DIM}Freed ~${RESET}${BOLD}${SUCCESS}${freed_mb} MB${RESET}${DIM} RAM${RESET}"
+    echo ""
+    add_to_report "Optimize: killed $killed processes, freed ~${freed_mb} MB RAM"
 
     pause_continue
 }
@@ -5069,6 +5383,9 @@ run_network_test() {
     ui_box_row "${DIM}Measuring connectivity, latency & DNS${RESET}"
     ui_box_bottom
     echo ""
+    ui_explain "This is read-only. It checks your connection, DNS and a short download test."
+    ui_explain "It does not change any network settings."
+    echo ""
 
     # Gateway
     local gw=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}')
@@ -5085,7 +5402,8 @@ run_network_test() {
     # Ping gateway
     echo "  ${BOLD}${PRIMARY}${BULLET} Gateway Latency${RESET}"
     if [[ "$gw" != "N/A" ]]; then
-        local gw_ping=$(ping -c 3 -t 2 "$gw" 2>/dev/null | tail -1 | awk -F'/' '{printf "%.1f ms", $5}')
+        local gw_out=$(ping -c 3 -t 2 "$gw" 2>/dev/null)
+        local gw_ping=$(echo "$gw_out" | awk -F'/' '/round-trip|stddev/ {printf "%.1f ms", $5; exit}')
         [[ -z "$gw_ping" ]] && gw_ping="unreachable"
         echo "    ${HIGHLIGHT}${gw_ping}${RESET}"
     else
@@ -5097,7 +5415,8 @@ run_network_test() {
     echo "  ${BOLD}${PRIMARY}${BULLET} Internet Latency${RESET}"
     local targets=("1.1.1.1" "8.8.8.8" "apple.com")
     for t in "${targets[@]}"; do
-        local ms=$(ping -c 2 -t 3 "$t" 2>/dev/null | tail -1 | awk -F'/' '{printf "%.1f", $5}')
+        local ping_out=$(ping -c 2 -t 3 "$t" 2>/dev/null)
+        local ms=$(echo "$ping_out" | awk -F'/' '/round-trip|stddev/ {printf "%.1f", $5; exit}')
         if [[ -n "$ms" ]]; then
             echo "    ${HIGHLIGHT}${t}${RESET} ${DIM}${BULLET}${RESET} ${SUCCESS}${ms} ms${RESET}"
         else
@@ -5123,11 +5442,12 @@ run_network_test() {
     echo "  ${DIM}(Connecting to external servers: Apple CDN, Cloudflare)${RESET}"
     echo "  ${BOLD}${PRIMARY}${BULLET} Download Speed (approx.)${RESET}"
     local dl_start=$EPOCHREALTIME
-    curl -s -o /dev/null -w "%{size_download}" "https://cdn.apple.com/content/downloads/13/62/002-57047-A_27LOQHKVUT/dntx7do0xkh19aygm2rpyh6n4s2w3z6ald/InstallAssistant.pkg" --max-time 5 --range 0-1048575 2>/dev/null
-    local dl_bytes=$?
+    local dl_bytes=""
+    local dl_exit=0
     dl_bytes=$(curl -s -o /dev/null -w "%{size_download}" "https://speed.cloudflare.com/__down?bytes=2000000" --max-time 8 2>/dev/null)
+    dl_exit=$?
     local dl_end=$EPOCHREALTIME
-    if [[ -n "$dl_bytes" && "$dl_bytes" -gt 0 ]] 2>/dev/null; then
+    if [[ $dl_exit -eq 0 && -n "$dl_bytes" && "$dl_bytes" -gt 0 ]] 2>/dev/null; then
         local dl_secs=$(LC_ALL=C awk -v s="$dl_start" -v e="$dl_end" 'BEGIN{printf "%.2f", e-s}')
         local dl_mbps=$(LC_ALL=C awk -v b="$dl_bytes" -v s="$dl_secs" 'BEGIN{if(s>0){printf "%.1f", (b*8)/(s*1000000)} else {print "?"}}')
         echo "    ${HIGHLIGHT}~${dl_mbps} Mbps${RESET} ${DIM}(${dl_bytes} bytes in ${dl_secs}s)${RESET}"
@@ -5146,6 +5466,9 @@ run_disk_benchmark() {
     ui_box_top "Disk Benchmark"
     ui_box_row "${DIM}Measuring sequential read & write speed${RESET}"
     ui_box_bottom
+    echo ""
+    ui_explain "This writes and reads one temporary 256 MB test file in /tmp, then deletes it."
+    ui_explain "It does not scan or delete your personal files."
     echo ""
 
     local test_file
@@ -5169,7 +5492,15 @@ run_disk_benchmark() {
     echo ""
 
     # Purge disk cache before read test
-    sudo purge 2>/dev/null
+    if ui_confirm "Flush cached disk data before the read test? This may briefly stall apps."; then
+        if ask_sudo; then
+            sudo purge 2>/dev/null
+        else
+            status_line INFO "Read test" "Skipping cache flush."
+        fi
+    else
+        status_line INFO "Read test" "Using normal cached read path."
+    fi
 
     # Read test
     echo "  ${BOLD}${PRIMARY}${BULLET} Read Speed${RESET}  ${DIM}(256 MB sequential)${RESET}"
@@ -5233,9 +5564,11 @@ basic_semantic_analysis() {
     
     echo "${BOLD}${PRIMARY}1. PROCESS HEALTH${RESET}"
     echo ""
+    echo "  ${DIM}This section looks for stuck background processes and too many auto-started services.${RESET}"
+    echo ""
     
     # Get zombie processes
-    local zombies=$(ps aux 2>/dev/null | grep -c " <defunct>" || echo "0")
+    local zombies=$(get_zombie_count)
     
     
     if [[ $zombies -gt 1 ]]; then
@@ -5250,7 +5583,7 @@ basic_semantic_analysis() {
     echo ""
     
     # Check login items
-    local login_items=$(launchctl list 2>/dev/null | grep -v "com.apple" | wc -l || echo "0")
+    local login_items=$(count_nonapple_launch_services)
     
     
     echo "  ${PRIMARY}Third-party launch agents: $login_items${RESET}"
@@ -5265,12 +5598,7 @@ basic_semantic_analysis() {
     echo ""
     
     # Check for many small files (fragmentation indicator) - with timeout
-    local small_files=0
-    if command -v timeout &>/dev/null; then
-        small_files=$(timeout 3 find "$HOME" -maxdepth 3 -type f -size -1k 2>/dev/null | wc -l || echo "0")
-    else
-        small_files=$(timeout 5 find "$HOME" -maxdepth 2 -type f -size -1k 2>/dev/null | wc -l || echo "0")
-    fi
+    local small_files=$(count_small_files_limited 3 3)
     
     
     echo "  ${PRIMARY}Small files (<1KB, limited search): $small_files${RESET}"
@@ -5325,7 +5653,7 @@ intermediate_semantic_analysis() {
     
     # Check for connectivity issues
     local dns_ok=0
-    if ping -c 1 -W 1 8.8.8.8 &>/dev/null; then
+    if ping -c 1 -W 1000 8.8.8.8 &>/dev/null; then
         dns_ok=1
         echo "  ${SUCCESS}✅ Internet connectivity: OK${RESET}"
     else
@@ -5357,11 +5685,15 @@ expert_semantic_analysis() {
     # Check for unsigned binaries in common locations - with timeout
     local unsigned=0
     if command -v timeout &>/dev/null; then
-        unsigned=$(timeout 5 find /Applications -maxdepth 2 -type f -perm /111 2>/dev/null | head -20 | while read -r f; do
+        unsigned=$(timeout 5 find /Applications -maxdepth 2 -type f 2>/dev/null | head -20 | while read -r f; do
+            [[ -x "$f" ]] || continue
             timeout 1 codesign -v "$f" 2>&1 | grep -q "invalid\|not signed" && echo "1"
         done | wc -l)
     else
-        unsigned=$(find /Applications -maxdepth 1 -type f -perm /111 2>/dev/null | wc -l)
+        unsigned=$(find /Applications -maxdepth 2 -type f 2>/dev/null | head -20 | while read -r f; do
+            [[ -x "$f" ]] || continue
+            codesign -v "$f" 2>&1 | grep -q "invalid\|not signed" && echo "1"
+        done | wc -l)
     fi
     
     echo "  ${PRIMARY}Unsigned/invalid binaries in /Applications: $unsigned${RESET}"
@@ -5402,10 +5734,10 @@ collect_process_data() {
     export LC_ALL=C
     if [[ "$data" == "full" ]]; then
         # Get all processes with CPU > 0.1%
-        output=$(ps aux 2>/dev/null | awk 'NR>1 && $3>0.1 {gsub(/,/, ".", $3); gsub(/,/, ".", $4); printf "{\"pid\":%s,\"cpu\":%.1f,\"mem\":%.1f,\"name\":\"%s\"}\n", $2, $3, $4, $11}' | sort -t: -k2 -rn | head -20)
+        output=$(ps aux 2>/dev/null | awk 'NR>1 && $3>0.1 {gsub(/,/, ".", $3); gsub(/,/, ".", $4); printf "%s\t%.1f\t%.1f\t%s\n", $2, $3, $4, $11}' | sort -k2,2nr | head -20 | awk -F'\t' '{printf "{\"pid\":%s,\"cpu\":%.1f,\"mem\":%.1f,\"name\":\"%s\"}\n", $1, $2, $3, $4}')
     else
         # Get top 5 processes only (sort by CPU descending)
-        output=$(ps aux 2>/dev/null | awk 'NR>1 {gsub(/,/, ".", $3); gsub(/,/, ".", $4); printf "{\"pid\":%s,\"cpu\":%.1f,\"mem\":%.1f,\"name\":\"%s\"}\n", $2, $3, $4, $11}' | sort -t: -k2 -rn | head -5)
+        output=$(ps aux 2>/dev/null | awk 'NR>1 {gsub(/,/, ".", $3); gsub(/,/, ".", $4); printf "%s\t%.1f\t%.1f\t%s\n", $2, $3, $4, $11}' | sort -k2,2nr | head -5 | awk -F'\t' '{printf "{\"pid\":%s,\"cpu\":%.1f,\"mem\":%.1f,\"name\":\"%s\"}\n", $1, $2, $3, $4}')
     fi
     
     echo "$output"
@@ -5418,13 +5750,10 @@ collect_startup_items() {
     local system_agents=0
     
     # Count user LaunchAgents
-    [[ -d "$HOME/Library/LaunchAgents" ]] && user_agents=$(ls -1 "$HOME/Library/LaunchAgents" 2>/dev/null | wc -l)
-    
-    # Count user LaunchDaemons
-    [[ -d "$HOME/Library/LaunchDaemons" ]] && user_daemons=$(ls -1 "$HOME/Library/LaunchDaemons" 2>/dev/null | wc -l)
+    user_agents=$(count_user_launch_agents)
     
     # Count system LaunchAgents (via launchctl)
-    system_agents=$(launchctl list 2>/dev/null | grep -v "com.apple" | wc -l)
+    system_agents=$(count_nonapple_launch_services)
     
     printf '{"user_agents":%d,"user_daemons":%d,"system_agents":%d}' "$user_agents" "$user_daemons" "$system_agents"
 }
@@ -5486,12 +5815,10 @@ collect_system_load() {
 
 # Detect zombie processes
 detect_zombies() {
-    local zombies=$(ps aux 2>/dev/null | grep -c " <defunct>" || echo "0")
-    [[ "$zombies" -gt 0 ]] && zombies=$((zombies - 1))
-    echo "$zombies"
+    get_zombie_count
 }
 
-# Compile all data into JSON for AI
+# Compile collected data into JSON
 compile_semantic_data() {
     local level="$1"  # basic, intermediate, expert
     [[ -z "$level" ]] && level="basic"
